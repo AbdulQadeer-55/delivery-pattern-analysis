@@ -4,6 +4,10 @@ import os
 import re
 import glob
 from datetime import datetime, timedelta
+import warnings
+
+# Suppress openpyxl warnings for cleaner output
+warnings.filterwarnings("ignore")
 
 # Configuration
 DATA_DIR = 'data'
@@ -22,117 +26,132 @@ PRODUCT_MAP = {
     'CLEAR DIESEL': 'LD'
 }
 
-def parse_date_from_filename(filename):
+def find_date_in_sheet(df, sheet_name, filename):
     """
-    Extracts date from filenames like 'NOV25.xlsx - NOV 29.csv'
+    Tries to find a date inside the sheet content. 
+    If not found, tries to parse the Sheet Name (e.g., 'JAN 1').
     """
-    base = os.path.basename(filename).upper()
-    # Remove extensions for cleaner parsing
-    base = base.replace('.CSV', '').replace('.XLSX', '')
-    
-    # Month mapping
-    month_map = {
-        'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
-        'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
-        'SEPT': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12
-    }
-    
-    try:
-        # Split by hyphen to find the specific day part (usually at the end)
-        parts = base.split('-')
-        day_part = parts[-1].strip()
+    # 1. Search in the first 10 rows of the sheet
+    for i in range(min(15, len(df))):
+        row_str = " ".join(df.iloc[i].astype(str).values)
+        # Look for YYYY-MM-DD or MM-DD-YYYY pattern
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', row_str)
+        if match:
+            return pd.to_datetime(match.group(1))
         
-        # Regex to find Month Word and Day Number (e.g., "NOV 29")
-        match = re.search(r'([A-Z]+)\s*(\d{1,2})', day_part)
+        # Look for typical Excel date formats if converted to string
+        match_alt = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', row_str)
+        if match_alt:
+            try:
+                return pd.to_datetime(match_alt.group(1))
+            except:
+                pass
+
+    # 2. Fallback: Parse the Sheet Name (e.g., "JAN 1", "NOV 29")
+    try:
+        # Clean sheet name
+        clean_name = sheet_name.upper().replace('.', ' ').strip()
+        # Extract Month and Day
+        match = re.search(r'([A-Z]+)\s*(\d{1,2})', clean_name)
         if match:
             m_str, d_str = match.groups()
-            # Fuzzy match month key
+            month_map = {
+                'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
+                'SEPT': 9
+            }
             for k, v in month_map.items():
                 if m_str.startswith(k):
-                    # Assuming year 2025 based on file naming convention
+                    # Assume 2025 based on file naming
                     return datetime(2025, v, int(d_str))
-    except Exception as e:
-        print(f"Warning: Could not parse date from {filename}")
-        return None
+    except:
+        pass
+        
     return None
 
 def process_files():
-    print("Scanning for files...")
-    all_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+    print("Scanning for Excel files in 'data/'...")
+    all_files = glob.glob(os.path.join(DATA_DIR, "*.xlsx"))
     
     if not all_files:
-        print("No CSV files found in 'data/' directory.")
+        print("No .xlsx files found. Please make sure the Excel files are in the 'data' folder.")
         return pd.DataFrame()
 
     all_data = []
 
     for f in all_files:
-        file_date = parse_date_from_filename(f)
-        if not file_date:
-            continue
-            
+        print(f"Processing file: {os.path.basename(f)}...")
         try:
-            # Read CSV with no header initially to locate the data block
-            df_raw = pd.read_csv(f, header=None)
+            # Read the Excel file (all sheets)
+            xls = pd.read_excel(f, sheet_name=None, header=None)
             
-            # Locate the header row containing 'Customer Name'
-            header_idx = -1
-            for i, row in df_raw.iterrows():
-                row_str = ' '.join(row.astype(str)).lower()
-                if 'customer name' in row_str and 'product' in row_str:
-                    header_idx = i
-                    break
-            
-            if header_idx == -1:
-                continue
-
-            # Reload using the found header
-            df = pd.read_csv(f, header=header_idx)
-            
-            # Normalize column names
-            df.columns = [str(c).strip().title() for c in df.columns]
-            
-            # Identify critical columns by keyword
-            cust_col = next((c for c in df.columns if 'Customer' in c), None)
-            prod_col = next((c for c in df.columns if 'Product' in c), None)
-            # Look for Gallons/Qty column
-            gal_cols = [c for c in df.columns if 'Gallons' in c or 'Qty' in c]
-            gal_col = gal_cols[0] if gal_cols else None
-
-            if not (cust_col and prod_col and gal_col):
-                continue
-
-            for _, row in df.iterrows():
-                cust = str(row[cust_col]).strip().upper()
-                
-                # Skip invalid rows or totals
-                if cust in ['NAN', '', 'TOTAL', 'GRAND TOTAL'] or 'SUM OF' in cust:
-                    continue
-                    
-                prod = str(row[prod_col]).strip().upper()
-                
-                # Parse Gallons (handle commas)
-                try:
-                    gal_val = str(row[gal_col]).replace(',', '')
-                    gallons = float(gal_val)
-                except ValueError:
+            for sheet_name, df_raw in xls.items():
+                # Skip likely non-data sheets
+                if 'sheet' in sheet_name.lower() and len(df_raw) < 5:
                     continue
 
-                if gallons > 0:
-                    # Clean Product Name
-                    clean_prod = prod
-                    for key, val in PRODUCT_MAP.items():
-                        if key in prod:
-                            clean_prod = val
-                            break
+                # Identify Date
+                file_date = find_date_in_sheet(df_raw, sheet_name, f)
+                if not file_date:
+                    # Skip if no date found (likely a summary tab or empty)
+                    continue
+
+                # Locate the header row containing 'Customer Name'
+                header_idx = -1
+                for i, row in df_raw.iterrows():
+                    row_str = ' '.join(row.astype(str)).lower()
+                    if 'customer name' in row_str and 'product' in row_str:
+                        header_idx = i
+                        break
+                
+                if header_idx == -1:
+                    continue
+
+                # Extract data block
+                df = df_raw.iloc[header_idx+1:].copy()
+                # Set proper column names from the header row
+                df.columns = df_raw.iloc[header_idx].astype(str).str.strip().str.title()
+                
+                # Identify critical columns
+                cust_col = next((c for c in df.columns if 'Customer' in str(c)), None)
+                prod_col = next((c for c in df.columns if 'Product' in str(c)), None)
+                gal_cols = [c for c in df.columns if 'Gallons' in str(c) or 'Qty' in str(c)]
+                gal_col = gal_cols[0] if gal_cols else None
+
+                if not (cust_col and prod_col and gal_col):
+                    continue
+
+                for _, row in df.iterrows():
+                    cust = str(row[cust_col]).strip().upper()
                     
-                    all_data.append({
-                        'Date': file_date,
-                        'Customer': cust,
-                        'Product': clean_prod,
-                        'Gallons': gallons,
-                        'Source_File': os.path.basename(f)
-                    })
+                    # Stop if we hit a total line or empty block
+                    if cust in ['NAN', '', 'TOTAL', 'GRAND TOTAL', 'NONE'] or 'SUM OF' in cust:
+                        continue
+                        
+                    prod = str(row[prod_col]).strip().upper()
+                    
+                    # Parse Gallons
+                    try:
+                        gal_val = str(row[gal_col]).replace(',', '')
+                        gallons = float(gal_val)
+                    except ValueError:
+                        continue
+
+                    if gallons > 0:
+                        # Clean Product Name
+                        clean_prod = prod
+                        for key, val in PRODUCT_MAP.items():
+                            if key in prod:
+                                clean_prod = val
+                                break
+                        
+                        all_data.append({
+                            'Date': file_date,
+                            'Customer': cust,
+                            'Product': clean_prod,
+                            'Gallons': gallons,
+                            'Source_File': f"{os.path.basename(f)} - {sheet_name}"
+                        })
 
         except Exception as e:
             print(f"Error reading {f}: {e}")
@@ -144,6 +163,7 @@ def analyze_patterns(df):
     if df.empty:
         return pd.DataFrame()
 
+    print("Analyzing delivery patterns...")
     summary_list = []
     
     # Group by Customer and Product
@@ -161,11 +181,11 @@ def analyze_patterns(df):
         avg_days = 0
 
         if count > 1:
-            # Calculate intervals between deliveries
+            # Calculate intervals
             intervals = np.diff(dates).astype('timedelta64[D]').astype(int)
             avg_days = np.mean(intervals)
             
-            # Determine Frequency Category
+            # Determine Frequency
             if 5 <= avg_days <= 9:
                 freq_label = "Weekly"
             elif 12 <= avg_days <= 16:
@@ -176,12 +196,12 @@ def analyze_patterns(df):
                 freq_label = f"Custom ({int(avg_days)} days)"
 
             # Forecast Next Date
-            next_delivery = last_delivery + timedelta(days=int(avg_days))
+            next_delivery = pd.to_datetime(last_delivery) + timedelta(days=int(avg_days))
             next_date = next_delivery.strftime('%Y-%m-%d')
 
-            # Identify Day of Week Pattern (if frequent)
+            # Identify Day of Week Pattern
             if count >= 3:
-                days_of_week = [d.strftime('%A') for d in pd.to_datetime(dates)]
+                days_of_week = [pd.to_datetime(d).strftime('%A') for d in dates]
                 pattern_day = max(set(days_of_week), key=days_of_week.count)
 
         summary_list.append({
@@ -190,7 +210,7 @@ def analyze_patterns(df):
             'Frequency': freq_label,
             'Avg Interval (Days)': round(avg_days, 1),
             'Pattern Day': pattern_day,
-            'Last Delivery': last_delivery.strftime('%Y-%m-%d'),
+            'Last Delivery': pd.to_datetime(last_delivery).strftime('%Y-%m-%d'),
             'Forecasted Date': next_date,
             'Total Deliveries': count,
             'Total Gallons': total_vol
@@ -220,4 +240,4 @@ if __name__ == "__main__":
             
         print(f"Analysis complete. Report saved to: {output_path}")
     else:
-        print("No valid data found. Please ensure CSV files are in the 'data/' folder.")
+        print("No valid data found.")
